@@ -253,11 +253,31 @@ typedef NS_ENUM(NSInteger, ImagePickerClassType) { UIImagePickerClassType, PHPic
   UIImagePickerController *imagePickerController = [self createImagePickerController];
   imagePickerController.modalPresentationStyle = UIModalPresentationCurrentContext;
   imagePickerController.delegate = self;
-  imagePickerController.mediaTypes = @[
-    (NSString *)kUTTypeMovie, (NSString *)kUTTypeAVIMovie, (NSString *)kUTTypeVideo,
+// Configura i media types includendo HEVC se disponibile
+NSMutableArray *mediaTypes = [NSMutableArray arrayWithArray:@[
+    (NSString *)kUTTypeMovie, 
+    (NSString *)kUTTypeAVIMovie, 
+    (NSString *)kUTTypeVideo,
     (NSString *)kUTTypeMPEG4
-  ];
+]];
+
+// Aggiungi supporto HEVC per iOS 11+
+if (@available(iOS 11.0, *)) {
+    // HEVC/H.265 types
+    [mediaTypes addObject:AVFileTypeHEIC];
+    [mediaTypes addObject:AVFileTypeHEIF];
+    if (@available(iOS 13.0, *)) {
+        [mediaTypes addObject:(NSString *)kUTTypeHEVC];
+    }
+}
+
+imagePickerController.mediaTypes = mediaTypes;
   imagePickerController.videoQuality = UIImagePickerControllerQualityTypeHigh;
+
+  // AGGIUNGI: Configurazione per HEVC su iOS 11+
+  if (@available(iOS 11.0, *)) {
+    imagePickerController.videoExportPreset = AVAssetExportPresetHEVCHighestQuality;
+  }
 
   if (maxDurationSeconds) {
     NSTimeInterval max = [maxDurationSeconds doubleValue];
@@ -527,19 +547,46 @@ typedef NS_ENUM(NSInteger, ImagePickerClassType) { UIImagePickerClassType, PHPic
     return;
   }
   if (videoURL != nil) {
-    if (@available(iOS 13.0, *)) {
-      NSURL *destination = [FLTImagePickerPhotoAssetUtil saveVideoFromURL:videoURL];
-      if (destination == nil) {
-        [self sendCallResultWithError:[FlutterError
-                                          errorWithCode:@"flutter_image_picker_copy_video_error"
-                                                message:@"Could not cache the video file."
-                                                details:nil]];
-        return;
+    // Gestione HEVC per iOS 11+
+    if (@available(iOS 11.0, *)) {
+      __weak typeof(self) weakSelf = self;
+      [self convertVideoToHEVC:videoURL completion:^(NSURL *convertedURL, FlutterError *error) {
+        if (error) {
+          [weakSelf sendCallResultWithError:error];
+        } else {
+          NSURL *finalURL = convertedURL;
+          
+          // Per iOS 13+, salva anche nel formato corretto
+          if (@available(iOS 13.0, *)) {
+            NSURL *destination = [FLTImagePickerPhotoAssetUtil saveVideoFromURL:finalURL];
+            if (destination == nil) {
+              [weakSelf sendCallResultWithError:[FlutterError
+                                                errorWithCode:@"flutter_image_picker_copy_video_error"
+                                                      message:@"Could not cache the video file."
+                                                      details:nil]];
+              return;
+            }
+            finalURL = destination;
+          }
+          
+          [weakSelf sendCallResultWithSavedPathList:@[ finalURL.path ]];
+        }
+      }];
+    } else {
+      // iOS < 11, usa il flusso normale senza HEVC
+      if (@available(iOS 13.0, *)) {
+        NSURL *destination = [FLTImagePickerPhotoAssetUtil saveVideoFromURL:videoURL];
+        if (destination == nil) {
+          [self sendCallResultWithError:[FlutterError
+                                            errorWithCode:@"flutter_image_picker_copy_video_error"
+                                                  message:@"Could not cache the video file."
+                                                  details:nil]];
+          return;
+        }
+        videoURL = destination;
       }
-
-      videoURL = destination;
+      [self sendCallResultWithSavedPathList:@[ videoURL.path ]];
     }
-    [self sendCallResultWithSavedPathList:@[ videoURL.path ]];
   } else {
     UIImage *image = info[UIImagePickerControllerEditedImage];
     if (image == nil) {
@@ -606,6 +653,62 @@ typedef NS_ENUM(NSInteger, ImagePickerClassType) { UIImagePickerClassType, PHPic
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
   [picker dismissViewControllerAnimated:YES completion:nil];
   [self sendCallResultWithSavedPathList:nil];
+}
+
+#pragma mark - HEVC Support
+
+- (void)convertVideoToHEVC:(NSURL *)inputURL 
+                completion:(void (^)(NSURL *outputURL, FlutterError *error))completion 
+                API_AVAILABLE(ios(11.0)) {
+  AVAsset *asset = [AVAsset assetWithURL:inputURL];
+  
+  // Verifica se il video è già in HEVC
+  AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+  if (videoTrack) {
+    CMFormatDescriptionRef formatDescription = (__bridge CMFormatDescriptionRef)videoTrack.formatDescriptions.firstObject;
+    FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDescription);
+    
+    if (codec == kCMVideoCodecType_HEVC) {
+      // È già HEVC, ritorna l'URL originale
+      completion(inputURL, nil);
+      return;
+    }
+  }
+  
+  // Configura l'export session per HEVC
+  AVAssetExportSession *exportSession = [[AVAssetExportSession alloc] 
+      initWithAsset:asset 
+      presetName:AVAssetExportPresetHEVCHighestQuality];
+  
+  if (exportSession == nil) {
+    // HEVC non supportato su questo dispositivo
+    completion(inputURL, nil);
+    return;
+  }
+  
+  // Crea un path temporaneo per il video convertito
+  NSString *outputPath = [NSTemporaryDirectory() 
+      stringByAppendingPathComponent:
+      [NSString stringWithFormat:@"hevc_video_%@.mov", [[NSUUID UUID] UUIDString]]];
+  
+  NSURL *outputURL = [NSURL fileURLWithPath:outputPath];
+  exportSession.outputURL = outputURL;
+  exportSession.outputFileType = AVFileTypeQuickTimeMovie;
+  exportSession.shouldOptimizeForNetworkUse = YES;
+  
+  [exportSession exportAsynchronouslyWithCompletionHandler:^{
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (exportSession.status == AVAssetExportSessionStatusCompleted) {
+        // Rimuovi il file originale per risparmiare spazio
+        [[NSFileManager defaultManager] removeItemAtURL:inputURL error:nil];
+        completion(outputURL, nil);
+      } else {
+        NSLog(@"HEVC export failed: %@", exportSession.error);
+        // In caso di errore, usa il video originale
+        completion(inputURL, nil);
+      }
+    });
+  }];
 }
 
 #pragma mark -
